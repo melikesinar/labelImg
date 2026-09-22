@@ -154,6 +154,9 @@ class MainWindow(QMainWindow, WindowMixin):
 
         # Create and add a widget for showing current label items
         self.label_list = QListWidget()
+        # Allow selecting multiple labels with Ctrl/Shift so they can be
+        # renamed together from the existing Edit Label action.
+        self.label_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         label_list_container = QWidget()
         label_list_container.setLayout(list_layout)
         self.label_list.itemActivated.connect(self.label_selection_changed)
@@ -235,6 +238,9 @@ class MainWindow(QMainWindow, WindowMixin):
 
         open_prev_image = action(get_str('prevImg'), self.open_prev_image,
                                  'a', 'prev', get_str('prevImgDetail'))
+
+        go_to_image = action('Go to Image', self.go_to_image,
+                             'Ctrl+G', None, 'Jump directly to an image number')
 
         verify = action(get_str('verifyImg'), self.verify_image,
                         'space', 'verify', get_str('verifyImgDetail'))
@@ -427,7 +433,8 @@ class MainWindow(QMainWindow, WindowMixin):
         self.display_label_option.triggered.connect(self.toggle_paint_labels_option)
 
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
+                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles,
+                     open_prev_image, open_next_image, go_to_image, None, save, save_format, save_as, close, reset_all, delete_image, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut))
         add_actions(self.menus.view, (
             self.auto_saving,
@@ -449,12 +456,12 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.tools = self.toolbar('Tools')
         self.actions.beginner = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
+            open, open_dir, change_save_dir, open_next_image, open_prev_image, go_to_image, verify, save, save_format, None, create, copy, delete, None,
             zoom_in, zoom, zoom_out, fit_window, fit_width, None,
             light_brighten, light, light_darken, light_org)
 
         self.actions.advanced = (
-            open, open_dir, change_save_dir, open_next_image, open_prev_image, save, save_format, None,
+            open, open_dir, change_save_dir, open_next_image, open_prev_image, go_to_image, save, save_format, None,
             create_mode, edit_mode, None,
             hide_all, show_all)
 
@@ -752,15 +759,24 @@ class MainWindow(QMainWindow, WindowMixin):
     def edit_label(self):
         if not self.canvas.editing():
             return
-        item = self.current_item()
-        if not item:
+
+        items = self.label_list.selectedItems()
+        if not items:
             return
-        text = self.label_dialog.pop_up(item.text())
+
+        # If more than one label is selected, the same value is applied to
+        # every selected bounding box. This keeps the normal single-label
+        # editing behaviour unchanged while adding bulk rename support.
+        text = self.label_dialog.pop_up(items[0].text())
         if text is not None:
-            item.setText(text)
-            item.setBackground(generate_color_by_text(text))
+            color = generate_color_by_text(text)
+            for item in items:
+                item.setText(text)
+                item.setBackground(color)
+
             self.set_dirty()
             self.update_combo_box()
+            self.canvas.update()
 
     # Tzutalin 20160906 : Add file list and dock to move faster
     def file_item_double_clicked(self, item=None):
@@ -1306,7 +1322,7 @@ class MainWindow(QMainWindow, WindowMixin):
         if dir_path is not None and len(dir_path) > 1:
             self.default_save_dir = dir_path
 
-        self.show_bounding_box_from_annotation_file(self.file_path)
+        self.show_bounding_box_from_annotation_file(str(self.file_path))
 
         self.statusBar().showMessage('%s . Annotation will be saved to %s' %
                                      ('Change saved folder', self.default_save_dir))
@@ -1358,8 +1374,6 @@ class MainWindow(QMainWindow, WindowMixin):
         self.last_open_dir = target_dir_path
         self.import_dir_images(target_dir_path)
         self.default_save_dir = target_dir_path
-        if self.file_path:
-            self.show_bounding_box_from_annotation_file(file_path=self.file_path)
 
     def import_dir_images(self, dir_path):
         if not self.may_continue() or not dir_path:
@@ -1450,6 +1464,40 @@ class MainWindow(QMainWindow, WindowMixin):
         if filename:
             self.load_file(filename)
 
+    def go_to_image(self, _value=False):
+        if not self.m_img_list or self.img_count <= 0:
+            return
+
+        if self.auto_saving.isChecked():
+            if self.default_save_dir is not None:
+                if self.dirty is True:
+                    self.save_file()
+            else:
+                self.change_save_dir_dialog()
+                return
+
+        if not self.may_continue():
+            return
+
+        current_number = self.cur_img_idx + 1 if 0 <= self.cur_img_idx < self.img_count else 1
+        image_number, ok = QInputDialog.getInt(
+            self,
+            'Go to Image',
+            'Image number (1-%d):' % self.img_count,
+            current_number,
+            1,
+            self.img_count,
+            1
+        )
+
+        if not ok:
+            return
+
+        self.cur_img_idx = image_number - 1
+        filename = self.m_img_list[self.cur_img_idx]
+        if filename:
+            self.load_file(filename)
+
     def open_file(self, _value=False):
         if not self.may_continue():
             return
@@ -1521,7 +1569,55 @@ class MainWindow(QMainWindow, WindowMixin):
         if delete_path is not None:
             idx = self.cur_img_idx
             if os.path.exists(delete_path):
+                # Eğer kaydedilmemiş değişiklikler varsa
+                if self.dirty:
+                    # Kullanıcıya sor
+                    discard_changes = self.discard_changes_dialog()
+                    if discard_changes == QMessageBox.Cancel:
+                        return  # İptal edilirse hiçbir şey yapma
+                    elif discard_changes == QMessageBox.Yes:
+                        # Değişiklikleri kaydetmeden önce etiket dosyalarını sil
+                        file_path_without_ext = os.path.splitext(delete_path)[0]
+                        
+                        # PASCAL VOC format (.xml)
+                        xml_file = file_path_without_ext + '.xml'
+                        if os.path.exists(xml_file):
+                            os.remove(xml_file)
+                            
+                        # YOLO format (.txt)
+                        txt_file = file_path_without_ext + '.txt'
+                        if os.path.exists(txt_file):
+                            os.remove(txt_file)
+                            
+                        # CreateML format (.json)
+                        json_file = file_path_without_ext + '.json'
+                        if os.path.exists(json_file):
+                            os.remove(json_file)
+                        
+                        # Değişiklikleri kaydetme işlemini iptal et
+                        self.set_clean()
+                
+                # Görüntü dosyasını sil
                 os.remove(delete_path)
+                
+                # Etiket dosyalarını tekrar kontrol et ve sil (eğer hala varsa)
+                file_path_without_ext = os.path.splitext(delete_path)[0]
+                
+                # PASCAL VOC format (.xml)
+                xml_file = file_path_without_ext + '.xml'
+                if os.path.exists(xml_file):
+                    os.remove(xml_file)
+                    
+                # YOLO format (.txt)
+                txt_file = file_path_without_ext + '.txt'
+                if os.path.exists(txt_file):
+                    os.remove(txt_file)
+                    
+                # CreateML format (.json)
+                json_file = file_path_without_ext + '.json'
+                if os.path.exists(json_file):
+                    os.remove(json_file)
+                
             self.import_dir_images(self.last_open_dir)
             if self.img_count > 0:
                 self.cur_img_idx = min(idx, self.img_count - 1)
